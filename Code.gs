@@ -5,7 +5,8 @@
  *  - 선원    : 학번 1개당 1줄. 이름, 도장 개수, 부스별 도장 시각
  *  - 부스코드 : 부스별 4자리 코드 (setup() 실행 시 자동 생성, 직접 바꿔도 됨)
  *  - 기록    : 모든 도장 시도 로그 (성공/실패)
- *  - 사진    : 출석 인증 탭에서 올린 지류 도장판 사진 (원본은 드라이브 폴더)
+ *  - 출석 요건 충족 : 웹 도장 7개 이상인 선원 + 지류 도장판 사진 (스크립트가 자동으로 채움)
+ *  사진 원본·미리보기 파일은 드라이브 '이타카로의 귀환 도장판 사진' 폴더에 저장돼요.
  *
  * 처음 한 번 setup()을 실행한 뒤 웹 앱으로 배포하세요. README.md 참고.
  */
@@ -24,10 +25,13 @@ const BOOTHS = [
 // 기록용 구글 시트 ID (시트 주소의 /d/ 와 /edit 사이)
 const SHEET_ID = '1zlrrzxQMxnNVYc7AYMyChkpvEFrGdjGK1yLy78F7FeQ';
 const NEED = 7;
+const BOOTH_COL = 7;                          // 선원 탭에서 첫 부스 열 (G)
+const PHOTO_COL = BOOTH_COL + BOOTHS.length;  // 사진 제출 시각 / 원본 / 미리보기 ID
 const SAILOR_HEAD = ['학번', '이름', '도장 수', '이타카 자격', '등록 시각', '마지막 도장']
-  .concat(BOOTHS.map(b => b[1]));
+  .concat(BOOTHS.map(b => b[1])).concat(['사진 제출 시각', '사진 원본', '미리보기 파일 ID']);
+const QUAL_SHEET = '출석 요건 충족';
+const QUAL_HEAD = ['학번', '이름', '도장 수', '마지막 도장', '사진 제출', '도장판 사진', '원본', '출석 확인'];
 const PHOTO_FOLDER = '이타카로의 귀환 도장판 사진';
-const PHOTO_HEAD = ['제출 시각', '학번', '이름', '웹 도장 수', '사진', '원본', '확인'];
 const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
 const MAX_FAILS = 5;          // 같은 선원이 코드 틀리는 허용 횟수
 const FAIL_WINDOW_SEC = 600;  // 위 횟수를 세는 시간(10분)
@@ -65,17 +69,32 @@ function setup() {
   setupPhotos();
 }
 
-/* ---------- 사진 탭 + 드라이브 폴더 준비 (한 번 실행) ---------- */
+/* ---------- 출석 요건 충족 탭 + 사진 폴더 준비 (한 번 실행. 다시 실행하면 이 탭을 새로 만들어 출석 확인 체크가 초기화돼요) ---------- */
 function setupPhotos() {
   const ss = ss_();
-  const sh = ss.getSheetByName('사진') || ss.insertSheet('사진');
-  if (sh.getLastRow() < 1) {
-    sh.getRange(1, 1, 1, PHOTO_HEAD.length).setValues([PHOTO_HEAD]).setFontWeight('bold');
-    sh.setFrozenRows(1);
-    sh.getRange('B:B').setNumberFormat('@');
-    sh.setColumnWidth(5, 140);
-  }
+  ss.getSheetByName('선원').getRange(1, 1, 1, SAILOR_HEAD.length).setValues([SAILOR_HEAD]).setFontWeight('bold');
+  let q = ss.getSheetByName(QUAL_SHEET);
+  if (!q) q = ss.insertSheet(QUAL_SHEET, 1);
+  q.clear();
+  q.getRange(1, 1, 1, QUAL_HEAD.length).setValues([QUAL_HEAD]).setFontWeight('bold');
+  q.getRange('J1').setFormula('="출석 요건 충족 "&COUNTA(A2:A)&"명 · 사진 제출 "&COUNTIF(E2:E,"O")&"명"').setFontWeight('bold');
+  q.setFrozenRows(1);
+  q.getRange('A:A').setNumberFormat('@');
+  q.getRange('D:D').setNumberFormat('m"월" d"일" hh:mm');
+  q.setColumnWidth(6, 160);
   folder_();
+  const sh = ss.getSheetByName('선원');
+  // 예전 '사진' 탭이 있으면 선원 탭으로 옮기고 지워요.
+  const old = ss.getSheetByName('사진');
+  if (old) {
+    old.getDataRange().getValues().slice(1).forEach(v => {
+      const r = findRow_(sh, String(v[1]));
+      if (r && v[5]) sh.getRange(r, PHOTO_COL, 1, 3).setValues([[v[0], v[5], '']]);
+    });
+    ss.deleteSheet(old);
+  }
+  const last = sh.getLastRow();
+  for (let r = 2; r <= last; r++) syncQual_(sh, r);
 }
 
 /* ---------- 웹 앱 입구 ---------- */
@@ -140,7 +159,7 @@ function stamp_(sid, name, booth, code) {
       log_(sid, who, booth, '코드 틀림');
       throw new Error('코드가 맞지 않아요. 부스 RA에게 다시 확인해 주세요.');
     }
-    const col = SAILOR_HEAD.length - BOOTHS.length + idx + 1;
+    const col = BOOTH_COL + idx;
     const cell = sh.getRange(r, col);
     let already = true;
     if (!cell.getValue()) {
@@ -151,6 +170,7 @@ function stamp_(sid, name, booth, code) {
     const stamps = stampsOf_(sh, r);
     sh.getRange(r, 3, 1, 2).setValues([[stamps.length, stamps.length >= NEED ? 'O' : '']]);
     log_(sid, who, booth, already ? '이미 받음' : '도장');
+    if (!already && stamps.length >= NEED) syncQual_(sh, r);
     return { name: who, stamps: stamps, already: already };
   });
 }
@@ -178,24 +198,51 @@ function photo_(sid, name, image, thumb) {
   const count = stampsOf_(sailors, r).length;
   const when = Utilities.formatDate(new Date(), 'Asia/Seoul', 'MMdd_HHmmss');
   const ext = m[1] === 'image/png' ? 'png' : m[1] === 'image/webp' ? 'webp' : 'jpg';
-  const file = folder_().createFile(Utilities.newBlob(bytes, m[1], sid + '_' + who + '_' + when + '.' + ext));
+  const base = sid + '_' + who + '_' + when;
+  const file = folder_().createFile(Utilities.newBlob(bytes, m[1], base + '.' + ext));
+  let thumbId = '';
+  const t = /^data:image\/(jpeg|png);base64,([A-Za-z0-9+/=]+)$/.exec(thumb);
+  if (t) thumbId = folder_().createFile(Utilities.newBlob(Utilities.base64Decode(t[2]), 'image/' + t[1], base + '_미리보기.' + (t[1] === 'png' ? 'png' : 'jpg'))).getId();
 
   return withLock_(() => {
-    const sh = sheet_('사진');
-    sh.appendRow([new Date(), sid, who, count, '', file.getUrl(), false]);
-    const row = sh.getLastRow();
-    sh.getRange(row, 7).insertCheckboxes();
-    sh.setRowHeight(row, 120);
-    if (/^data:image\/(?:jpeg|png);base64,/.test(thumb) && thumb.length < 1500000) {
-      try {
-        const img = SpreadsheetApp.newCellImage().setSourceUrl(thumb).setAltTextTitle(sid + ' 도장판').build();
-        sh.getRange(row, 5).setValue(img);
-      } catch (err) {
-        sh.getRange(row, 5).setValue('미리보기 실패 · 원본 링크 확인');
-      }
-    }
+    sailors.getRange(r, PHOTO_COL, 1, 3).setValues([[new Date(), file.getUrl(), thumbId]]);
+    syncQual_(sailors, r, t ? thumb : '');
     return { saved: true, stamps: stampsOf_(sailors, r) };
   });
+}
+
+/* 선원 탭 r행 기준으로 '출석 요건 충족' 탭의 그 사람 줄을 만들거나 고쳐요. 출석 확인 체크는 건드리지 않아요. */
+function syncQual_(sh, r, thumbUrl) {
+  const row = sh.getRange(r, 1, 1, PHOTO_COL + 2).getValues()[0];
+  const sid = String(row[0]);
+  const count = stampsOf_(sh, r).length;
+  if (!sid || count < NEED) return;
+  const q = sheet_(QUAL_SHEET);
+  let qr = findRow_(q, sid);
+  if (!qr) {
+    q.appendRow([sid]);
+    qr = q.getLastRow();
+    q.getRange(qr, 8).insertCheckboxes();
+  }
+  const sent = row[PHOTO_COL - 1], link = row[PHOTO_COL], thumbId = row[PHOTO_COL + 1];
+  q.getRange(qr, 1, 1, 5).setValues([[sid, row[1], count, row[5], sent ? 'O' : 'X']]);
+  q.getRange(qr, 7).setValue(link || '');
+  if (!sent) return;
+  const fileId = thumbId || ((String(link).match(/\/d\/([\w-]+)/) || [])[1]);
+  if (!thumbUrl && fileId) {
+    try {
+      const blob = DriveApp.getFileById(fileId).getBlob();
+      thumbUrl = 'data:' + blob.getContentType() + ';base64,' + Utilities.base64Encode(blob.getBytes());
+    } catch (err) {}
+  }
+  if (thumbUrl) {
+    try {
+      q.getRange(qr, 6).setValue(SpreadsheetApp.newCellImage().setSourceUrl(thumbUrl).setAltTextTitle(sid + ' 도장판').build());
+      q.setRowHeight(qr, 120);
+    } catch (err) {
+      q.getRange(qr, 6).setValue('미리보기 실패 · 원본 링크 확인');
+    }
+  }
 }
 
 /* ---------- 도우미 ---------- */
@@ -220,8 +267,7 @@ function findRow_(sh, sid) {
   return hit ? hit.getRow() : 0;
 }
 function stampsOf_(sh, r) {
-  const start = SAILOR_HEAD.length - BOOTHS.length + 1;
-  const vals = sh.getRange(r, start, 1, BOOTHS.length).getValues()[0];
+  const vals = sh.getRange(r, BOOTH_COL, 1, BOOTHS.length).getValues()[0];
   return BOOTHS.filter((b, i) => vals[i] !== '' && vals[i] !== null).map(b => b[0]);
 }
 function codeOf_(booth) {
