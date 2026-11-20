@@ -1,8 +1,8 @@
 /**
  * 이타카로의 귀환 · 도장 기록 백엔드 (Google Apps Script)
  *
- * 구글 시트에 붙여 쓰는 스크립트예요. 시트 탭 3개를 씁니다.
- *  - 선원    : 선원 1명당 1줄. 이름, 도장 개수, 부스별 도장 시각
+ * 아래 SHEET_ID의 구글 시트에 기록하는 스크립트예요. 시트 탭 3개를 씁니다.
+ *  - 선원    : 학번 1개당 1줄. 이름, 도장 개수, 부스별 도장 시각
  *  - 부스코드 : 부스별 4자리 코드 (setup() 실행 시 자동 생성, 직접 바꿔도 됨)
  *  - 기록    : 모든 도장 시도 로그 (성공/실패)
  *
@@ -20,19 +20,22 @@ const BOOTHS = [
   ['ogygia', '오기기아'],
   ['scheria', '스케리아'],
 ];
+// 기록용 구글 시트 ID (시트 주소의 /d/ 와 /edit 사이)
+const SHEET_ID = '1zlrrzxQMxnNVYc7AYMyChkpvEFrGdjGK1yLy78F7FeQ';
 const NEED = 7;
-const SAILOR_HEAD = ['선원 ID', '이름', '도장 수', '이타카 자격', '등록 시각', '마지막 도장']
+const SAILOR_HEAD = ['학번', '이름', '도장 수', '이타카 자격', '등록 시각', '마지막 도장']
   .concat(BOOTHS.map(b => b[1]));
 const MAX_FAILS = 5;          // 같은 선원이 코드 틀리는 허용 횟수
 const FAIL_WINDOW_SEC = 600;  // 위 횟수를 세는 시간(10분)
 
 /* ---------- 최초 설정: 편집기에서 한 번 실행 ---------- */
 function setup() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = ss_();
   const sailors = ss.getSheetByName('선원') || ss.insertSheet('선원');
   sailors.getRange(1, 1, 1, SAILOR_HEAD.length).setValues([SAILOR_HEAD]).setFontWeight('bold');
   sailors.setFrozenRows(1);
   sailors.setFrozenColumns(2);
+  sailors.getRange('A:A').setNumberFormat('@');
 
   const codes = ss.getSheetByName('부스코드') || ss.insertSheet('부스코드');
   if (codes.getLastRow() < 2) {
@@ -50,7 +53,7 @@ function setup() {
 
   const log = ss.getSheetByName('기록') || ss.insertSheet('기록');
   if (log.getLastRow() < 1) {
-    log.getRange(1, 1, 1, 5).setValues([['시각', '선원 ID', '이름', '부스', '결과']]).setFontWeight('bold');
+    log.getRange(1, 1, 1, 5).setValues([['시각', '학번', '이름', '부스', '결과']]).setFontWeight('bold');
     log.setFrozenRows(1);
   }
   const s1 = ss.getSheetByName('Sheet1') || ss.getSheetByName('시트1');
@@ -68,8 +71,8 @@ function doPost(e) {
 function handle_(p) {
   let out;
   try {
-    const sid = clean_(p.sid, 40);
-    if (!/^[a-z0-9-]{8,40}$/i.test(sid)) throw new Error('선원 ID가 올바르지 않아요.');
+    const sid = clean_(p.sno, 12);
+    if (!/^\d{8,10}$/.test(sid)) throw new Error('학번을 숫자로 정확히 적어 주세요.');
     if (p.action === 'register') out = register_(sid, clean_(p.name, 30));
     else if (p.action === 'stamp') out = stamp_(sid, clean_(p.name, 30), clean_(p.booth, 30), clean_(p.code, 10));
     else if (p.action === 'status') out = status_(sid);
@@ -100,7 +103,7 @@ function stamp_(sid, name, booth, code) {
   const idx = BOOTHS.findIndex(b => b[0] === booth);
   if (idx < 0) throw new Error('없는 부스예요.');
   const cache = CacheService.getScriptCache();
-  const fk = 'fail_' + sid;
+  const fk = 'fail_' + sid;  // sid = 학번
   const fails = Number(cache.get(fk) || 0);
   if (fails >= MAX_FAILS) throw new Error('코드를 여러 번 틀렸어요. 10분 뒤에 다시 시도하거나 RA에게 문의하세요.');
 
@@ -142,10 +145,11 @@ function status_(sid) {
 
 /* ---------- 도우미 ---------- */
 function sheet_(n) {
-  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(n);
+  const sh = ss_().getSheetByName(n);
   if (!sh) throw new Error('시트 설정이 안 됐어요. setup()을 먼저 실행해 주세요.');
   return sh;
 }
+function ss_() { return SpreadsheetApp.openById(SHEET_ID); }
 function findRow_(sh, sid) {
   const last = sh.getLastRow();
   if (last < 2) return 0;
