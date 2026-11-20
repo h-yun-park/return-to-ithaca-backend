@@ -5,6 +5,7 @@
  *  - 선원    : 학번 1개당 1줄. 이름, 도장 개수, 부스별 도장 시각
  *  - 부스코드 : 부스별 4자리 코드 (setup() 실행 시 자동 생성, 직접 바꿔도 됨)
  *  - 기록    : 모든 도장 시도 로그 (성공/실패)
+ *  - 사진    : 출석 인증 탭에서 올린 지류 도장판 사진 (원본은 드라이브 폴더)
  *
  * 처음 한 번 setup()을 실행한 뒤 웹 앱으로 배포하세요. README.md 참고.
  */
@@ -25,6 +26,9 @@ const SHEET_ID = '1zlrrzxQMxnNVYc7AYMyChkpvEFrGdjGK1yLy78F7FeQ';
 const NEED = 7;
 const SAILOR_HEAD = ['학번', '이름', '도장 수', '이타카 자격', '등록 시각', '마지막 도장']
   .concat(BOOTHS.map(b => b[1]));
+const PHOTO_FOLDER = '이타카로의 귀환 도장판 사진';
+const PHOTO_HEAD = ['제출 시각', '학번', '이름', '웹 도장 수', '사진', '원본', '확인'];
+const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
 const MAX_FAILS = 5;          // 같은 선원이 코드 틀리는 허용 횟수
 const FAIL_WINDOW_SEC = 600;  // 위 횟수를 세는 시간(10분)
 
@@ -58,6 +62,20 @@ function setup() {
   }
   const s1 = ss.getSheetByName('Sheet1') || ss.getSheetByName('시트1');
   if (s1 && s1.getLastRow() === 0 && ss.getSheets().length > 3) ss.deleteSheet(s1);
+  setupPhotos();
+}
+
+/* ---------- 사진 탭 + 드라이브 폴더 준비 (한 번 실행) ---------- */
+function setupPhotos() {
+  const ss = ss_();
+  const sh = ss.getSheetByName('사진') || ss.insertSheet('사진');
+  if (sh.getLastRow() < 1) {
+    sh.getRange(1, 1, 1, PHOTO_HEAD.length).setValues([PHOTO_HEAD]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+    sh.getRange('B:B').setNumberFormat('@');
+    sh.setColumnWidth(5, 140);
+  }
+  folder_();
 }
 
 /* ---------- 웹 앱 입구 ---------- */
@@ -76,6 +94,7 @@ function handle_(p) {
     if (p.action === 'register') out = register_(sid, clean_(p.name, 30));
     else if (p.action === 'stamp') out = stamp_(sid, clean_(p.name, 30), clean_(p.booth, 30), clean_(p.code, 10));
     else if (p.action === 'status') out = status_(sid);
+    else if (p.action === 'photo') out = photo_(sid, clean_(p.name, 30), String(p.image || ''), String(p.thumb || ''));
     else throw new Error('알 수 없는 요청이에요.');
     out.ok = true;
   } catch (err) {
@@ -143,7 +162,51 @@ function status_(sid) {
   return { registered: true, name: sh.getRange(r, 2).getValue(), stamps: stampsOf_(sh, r) };
 }
 
+function photo_(sid, name, image, thumb) {
+  const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(image);
+  if (!m) throw new Error('사진 파일을 읽지 못했어요. 다시 골라 주세요.');
+  const bytes = Utilities.base64Decode(m[2]);
+  if (bytes.length > MAX_PHOTO_BYTES) throw new Error('사진이 너무 커요.');
+  const sailors = sheet_('선원');
+  let r = findRow_(sailors, sid);
+  if (!r) {
+    if (!name) throw new Error('먼저 이름과 학번을 등록해 주세요.');
+    withLock_(() => sailors.appendRow([sid, name, 0, '', new Date(), ''].concat(BOOTHS.map(() => ''))));
+    r = findRow_(sailors, sid);
+  }
+  const who = sailors.getRange(r, 2).getValue();
+  const count = stampsOf_(sailors, r).length;
+  const when = Utilities.formatDate(new Date(), 'Asia/Seoul', 'MMdd_HHmmss');
+  const ext = m[1] === 'image/png' ? 'png' : m[1] === 'image/webp' ? 'webp' : 'jpg';
+  const file = folder_().createFile(Utilities.newBlob(bytes, m[1], sid + '_' + who + '_' + when + '.' + ext));
+
+  return withLock_(() => {
+    const sh = sheet_('사진');
+    sh.appendRow([new Date(), sid, who, count, '', file.getUrl(), false]);
+    const row = sh.getLastRow();
+    sh.getRange(row, 7).insertCheckboxes();
+    sh.setRowHeight(row, 120);
+    if (/^data:image\/(?:jpeg|png);base64,/.test(thumb) && thumb.length < 1500000) {
+      try {
+        const img = SpreadsheetApp.newCellImage().setSourceUrl(thumb).setAltTextTitle(sid + ' 도장판').build();
+        sh.getRange(row, 5).setValue(img);
+      } catch (err) {
+        sh.getRange(row, 5).setValue('미리보기 실패 · 원본 링크 확인');
+      }
+    }
+    return { saved: true, stamps: stampsOf_(sailors, r) };
+  });
+}
+
 /* ---------- 도우미 ---------- */
+function folder_() {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty('PHOTO_FOLDER_ID');
+  if (id) { try { return DriveApp.getFolderById(id); } catch (err) {} }
+  const f = DriveApp.createFolder(PHOTO_FOLDER);
+  props.setProperty('PHOTO_FOLDER_ID', f.getId());
+  return f;
+}
 function sheet_(n) {
   const sh = ss_().getSheetByName(n);
   if (!sh) throw new Error('시트 설정이 안 됐어요. setup()을 먼저 실행해 주세요.');
